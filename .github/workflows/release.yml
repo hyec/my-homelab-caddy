@@ -1,0 +1,176 @@
+name: release-image
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build and push even if the tracked version is unchanged
+        required: false
+        default: 'false'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - Dockerfile
+      - versions.json
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: caddy-cloudflare-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  detect-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Read tracked metadata
+        id: tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+
+          data = json.load(open('versions.json'))
+          print(f"tracked_version={data['caddy_version']}")
+          print(f"plugin={data['plugin']}")
+          print(f"plugin_version={data['plugin_version']}")
+          PY
+
+      - name: Fetch latest upstream Caddy release
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_version=$(python3 scripts/get_latest_caddy_release.py)
+          echo "latest_version=${latest_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to update metadata
+        id: decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          force_build='${{ github.event.inputs.force_build }}'
+          tracked='${{ steps.tracked.outputs.tracked_version }}'
+          latest='${{ steps.upstream.outputs.latest_version }}'
+          should_update=false
+          should_build=false
+
+          if [[ "$latest" != "$tracked" ]]; then
+            should_update=true
+            should_build=true
+          elif [[ '${{ github.event_name }}' == 'push' || "$force_build" == 'true' ]]; then
+            should_build=true
+          fi
+
+          echo "should_update=${should_update}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${should_build}" >> "$GITHUB_OUTPUT"
+          echo "effective_version=${latest}" >> "$GITHUB_OUTPUT"
+
+      - name: Report no-op
+        if: steps.decision.outputs.should_build != 'true'
+        shell: bash
+        run: |
+          echo "Tracked version already matches upstream (${{ steps.tracked.outputs.tracked_version }}) and no forced build was requested."
+
+      - name: Log in to GHCR
+        if: steps.decision.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        if: steps.decision.outputs.should_build == 'true'
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          python_output=$(python3 scripts/compute_tags.py '${{ steps.decision.outputs.effective_version }}' "$image")
+          echo "$python_output"
+          tags=$(python3 -c 'import json,sys; print("\n".join(json.loads(sys.stdin.read())["tags"]))' <<< "$python_output")
+          {
+            echo 'tags<<EOF'
+            echo "$tags"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.decision.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.decision.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            CADDY_VERSION=${{ steps.decision.outputs.effective_version }}
+            CLOUDFLARE_PLUGIN=${{ steps.tracked.outputs.plugin }}
+            CLOUDFLARE_PLUGIN_VERSION=${{ steps.tracked.outputs.plugin_version }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Update tracked metadata after successful publish
+        if: steps.decision.outputs.should_update == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          version = '${{ steps.upstream.outputs.latest_version }}'
+
+          versions_path = Path('versions.json')
+          data = json.loads(versions_path.read_text())
+          data['caddy_version'] = version
+          versions_path.write_text(json.dumps(data, indent=2) + '\n')
+
+          dockerfile_path = Path('Dockerfile')
+          dockerfile = dockerfile_path.read_text()
+          updated_dockerfile, replacements = re.subn(
+              r'^ARG CADDY_VERSION=\\d+\\.\\d+\\.\\d+$',
+              f'ARG CADDY_VERSION={version}',
+              dockerfile,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if replacements != 1:
+              raise SystemExit('Expected to update exactly one Dockerfile CADDY_VERSION default')
+          dockerfile_path.write_text(updated_dockerfile)
+          PY
+
+      - name: Commit updated version metadata after successful publish
+        if: steps.decision.outputs.should_update == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Dockerfile versions.json
+          git commit -m "chore: bump Caddy to v${{ steps.upstream.outputs.latest_version }}"
+          git push
