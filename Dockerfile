@@ -5,7 +5,7 @@ FROM docker.io/caddy:${CADDY_VERSION}-builder AS builder
 ARG CADDY_VERSION
 ARG CLOUDFLARE_PLUGIN
 ARG CLOUDFLARE_PLUGIN_VERSION
-RUN xcaddy build \
+RUN xcaddy build v${CADDY_VERSION} \
     --with github.com/caddy-dns/cloudflare
 
 FROM docker.io/caddy:${CADDY_VERSION}
